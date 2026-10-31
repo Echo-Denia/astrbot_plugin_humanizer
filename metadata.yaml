@@ -1,0 +1,29 @@
+name: astrbot_plugin_humanizer
+display_name: Humanizer - 拟人化助手
+short_desc: 让机器人更像真人：回复前随机延迟、去除尾随句号、加群/好友请求智能处理
+desc: |
+  让 AstrBot 的回复更接近真人行为。
+
+  功能：
+  1. 回复前随机延迟 —— LLM 回复后、发送前，随机等待一段时间再发出，
+     模拟人类打字思考。可配置最小/最大延迟（秒），支持按消息长度加权。
+  2. 去除尾随句号 —— 人类发消息并不总加句号，自动去掉句末的中/英文句号。
+  3. 已读不回 / 选择性忽略 —— LLM 决策或概率模式，模拟人类不总是秒回。
+  4. 加群请求处理（默认关闭）—— 监听 OneBot v11 加群请求事件，
+     可配置为自动同意、自动拒绝、或转发给管理员。
+  5. 好友申请处理 —— 支持 manual（通知管理员手动处理）、auto（自动同意）、
+     llm（LLM 判断，不确定时询问管理员）三种模式。
+
+  仅在 aiocqhttp (NapCat/OneBot v11) 平台生效。
+version: "1.6.0"
+author: dingshaozhen
+repo: "https://github.com/dingshaozhen/astrbot_plugin_humanizer"
+astrbot_version: ">=4.17.0"
+support_platforms:
+  - aiocqhttp
+tags:
+  - qq
+  - humanize
+  - delay
+  - napcat
+  - onebot
