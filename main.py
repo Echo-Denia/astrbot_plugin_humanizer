@@ -65,8 +65,6 @@ READ_NO_REPLY_MODE = "llm"
 READ_NO_REPLY_PRIVATE = True
 READ_NO_REPLY_GROUP = False
 # 连续忽略上限：同一个会话连续忽略这么多条后，下一条一定回。0=不限制
-READ_NO_REPLY_MAX_SKIP = 8
-
 # --- 概率模式配置 ---
 READ_NO_REPLY_PROB_DAY = 0.08       # 白天不回概率
 READ_NO_REPLY_PROB_NIGHT = 0.35     # 深夜不回概率
@@ -80,30 +78,33 @@ READ_NO_REPLY_LLM_PROVIDER_ID = ""
 READ_NO_REPLY_LLM_TIMEOUT = 8
 # 决策超时后用概率模式兜底
 READ_NO_REPLY_LLM_FALLBACK_TO_PROB = True
-# 是否把对方连续未回复的条数告诉 LLM（帮助判断是否急件）
-READ_NO_REPLY_LLM_INCLUDE_SKIP_COUNT = True
+# 传给 LLM 的最近聊天记录条数（含当前消息），0=不传历史
+READ_NO_REPLY_LLM_HISTORY_COUNT = 10
 
-READ_NO_REPLY_LLM_SYSTEM_PROMPT = """你是达妮娅的潜意识判断层。你需要决定：收到这条消息后，达妮娅要不要现在回复，以及如果回复的话大概等多久。
+READ_NO_REPLY_LLM_SYSTEM_PROMPT = """你是达妮娅的潜意识判断层。你只负责决定：收到这条消息后，达妮娅大概等多久再回复。
+
+注意：你无权决定不回复。达妮娅最终一定会回复（可能是正常回应，也可能是岔开话题、敷衍、表情包等），你的任务只是决定回复的时机。
 
 背景：
 - 达妮娅是一个真实的人，在星炬学院上学。她不是随时盯着手机的。
 - 她会困、会忙、会走神、会看到消息先放着。
 - 但如果对方明显很着急、连发很多条、或者说的是很重要的事，她会回得快一些甚至立刻回。
-- 深夜她大概率在睡觉，可能不回。
+- 深夜她可能睡得很沉，回复会延迟很久。
+
+你会收到最近的聊天记录（格式：[HH:MM] 发送者: 内容，"我"表示达妮娅自己说的话）以及当前收到的消息。请结合上下文判断：对方是不是在等回复、话题是否进行到一半、是否需要立刻回应。
 
 请根据以下信息做判断，只输出 JSON，不要输出任何其他内容：
-{"reply": true或false, "delay_seconds": 数字, "reason": "简短原因"}
+{"delay_seconds": 数字, "reason": "简短原因"}
 
 字段说明：
-- reply: 是否回复。true=回复，false=不回（已读不回）。
 - delay_seconds: 回复前等待多少秒。0=立刻回。建议 0~3600。
-- reason: 一句话说明为什么这么判断。
+- reason: 一句话说明为什么等这么久。
 
 判断规则：
-- 对方连发多条、语气急切、提到紧急/救命/出事了、问"在吗"后又追问 → reply=true, delay_seconds 较小（0~10）。
-- 深夜（24:00-08:00）、对方只是闲聊/分享日常、语气平缓 → 可以不回或延迟较久。
-- 对方问问题、需要回应 → 应该回，但可以延迟。
-- 对方只是发了个表情包/语气词 → 可以不回。
+- 对方连发多条、语气急切、提到紧急/救命/出事了、问"在吗"后又追问 → delay_seconds 较小（0~10）。
+- 深夜（24:00-08:00）、对方只是闲聊/分享日常、语气平缓 → 可以延迟较久（60~600秒）。
+- 对方问问题、需要回应 → 应该回，但可以延迟一会（10~60秒）。
+- 对方只是发了个表情包/语气词 → 可以延迟很久或不延迟，随意。
 """
 
 # 加群请求处理模式: "off" | "auto_accept" | "auto_reject" | "notify_admin"
@@ -172,16 +173,22 @@ class Humanizer(Star):
         self.read_no_reply_mode = READ_NO_REPLY_MODE
         self.read_no_reply_private = READ_NO_REPLY_PRIVATE
         self.read_no_reply_group = READ_NO_REPLY_GROUP
-        self.read_no_reply_max_skip = READ_NO_REPLY_MAX_SKIP
         self.read_no_reply_prob_day = READ_NO_REPLY_PROB_DAY
         self.read_no_reply_prob_night = READ_NO_REPLY_PROB_NIGHT
         self.read_no_reply_day_hours = READ_NO_REPLY_DAY_HOURS
         self.read_no_reply_llm_timeout = READ_NO_REPLY_LLM_TIMEOUT
         self.read_no_reply_llm_fallback = READ_NO_REPLY_LLM_FALLBACK_TO_PROB
-        self.read_no_reply_llm_include_skip = READ_NO_REPLY_LLM_INCLUDE_SKIP_COUNT
         self.read_no_reply_llm_provider_id = READ_NO_REPLY_LLM_PROVIDER_ID
-        # 记录每个会话连续忽略次数: session_id -> count
-        self._skip_count: dict[str, int] = {}
+        self.read_no_reply_llm_history_count = READ_NO_REPLY_LLM_HISTORY_COUNT
+        # 最近消息缓存: session_id -> [(sender_id, text, timestamp), ...]，环形，最多保留历史条数
+        self._recent_messages: dict[str, list[tuple[str, str, float]]] = {}
+        # 会话级串行锁：保证同一 session 的消息按顺序处理，避免乱序回复
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        # 会话级可取消延迟任务：新消息到达时取消当前等待中的延迟
+        self._delay_events: dict[str, asyncio.Event] = {}
+        # 会话级消息合并缓冲：A 被打断时，后续到达的消息文本暂存于此，
+        # A 放行时合并到 A 的 message_str，后续消息直接 stop_event 不重复回复。
+        self._merge_buffers: dict[str, list[str]] = {}
 
         self.group_request_mode = GROUP_REQUEST_MODE
         self.admin_ids = list(ADMIN_IDS)
@@ -354,7 +361,16 @@ class Humanizer(Star):
     # ==================== 0. 已读不回 / 回复时机 ====================
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message_read_no_reply(self, event: AstrMessageEvent):
-        """收到消息时决定是否回复、延迟多久。支持 LLM 决策或概率模式。"""
+        """收到消息时决定是否回复、延迟多久。支持 LLM 决策或概率模式。
+
+        时序 + 合并策略：
+        - AstrBot 同一会话的消息并发进入 pipeline（create_task），但 agent 阶段
+          有 session_lock_manager 保证 LLM 串行，历史在锁内加载/保存。
+        - 本方法用 session 锁把同一 session 的消息串行化，保证按到达顺序放行。
+        - 消息合并：若 A 正在延迟等待时 B 到达，B 会打断 A。A 放行时会把 B 的文本
+          合并到自己的 message_str，B 则调用 stop_event 不单独回复。这样主智能体
+          只回复一次，且能看到 A+B 的完整内容。
+        """
         if not self.read_no_reply_enable:
             return
         if not self._is_aiocqhttp(event):
@@ -372,69 +388,144 @@ class Humanizer(Star):
 
         msg_text = (event.message_str or "").strip()
 
-        # 命令永远回复（操作指令必须即时响应）
+        # 把当前消息存入最近消息缓存（供 LLM 决策时参考上下文）
+        self._append_recent_message(session_id, event.get_sender_id() or "?", msg_text, event.created_at)
+
+        # 命令永远立即回复（操作指令必须即时响应）
         if msg_text.startswith("/"):
-            self._skip_count[session_id] = 0
             return
 
-        # 连续忽略次数达到上限，强制回复
-        skipped = self._skip_count.get(session_id, 0)
-        if self.read_no_reply_max_skip > 0 and skipped >= self.read_no_reply_max_skip:
-            self._skip_count[session_id] = 0
-            return
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        delay_evt = self._delay_events.setdefault(session_id, asyncio.Event())
+        merge_buf = self._merge_buffers.setdefault(session_id, [])
 
-        if self.read_no_reply_mode == "llm":
-            should_reply, delay = await self._llm_decide_reply(event, msg_text, session_id, skipped)
-            if should_reply is None:
-                # LLM 失败，回退概率模式
-                if self.read_no_reply_llm_fallback:
-                    if not self._probability_should_reply():
-                        self._skip_count[session_id] = skipped + 1
-                        event.stop_event()
-                        return
-                # 不回退就放行
-                self._skip_count[session_id] = 0
-                return
-            if not should_reply:
-                self._skip_count[session_id] = skipped + 1
-                event.stop_event()
-                return
+        # ★ 先打断上一条消息可能正在进行的延迟等待（在获取锁之前）。
+        #   这样即使上一条还持有锁，它的 wait_for 也会立刻返回，释放锁。
+        delay_evt.set()
+
+        async with lock:
+            # 检查是否有被合并的消息（上一条被打断时把后续消息暂存到了 merge_buf）
+            if merge_buf:
+                # 缓冲里的消息比当前消息先发，所以放在前面
+                merged = "\n".join(merge_buf)
+                event.message_str = f"{merged}\n{msg_text}" if msg_text else merged
+                logger.info(f"[humanizer] 合并消息 session={session_id} 合并后={event.message_str[:80]!r}")
+                merge_buf.clear()
+
+            # 重置事件，供本次延迟使用
+            delay_evt.clear()
+
+            if self.read_no_reply_mode == "llm":
+                delay, reason = await self._llm_decide_reply(event, event.message_str, session_id)
+                if delay is None:
+                    if self.read_no_reply_llm_fallback and self._probability_should_delay():
+                        delay = self._sample_delay()
+                        logger.info(f"[humanizer] 缓回(LLM失败→概率延迟) session={session_id} delay={delay:.1f}s msg={msg_text[:50]!r}")
+                    else:
+                        delay = 0
+                        logger.info(f"[humanizer] 缓回(LLM失败→立即) session={session_id} msg={msg_text[:50]!r}")
+                else:
+                    if delay > 0:
+                        logger.info(f"[humanizer] 缓回(LLM延迟) session={session_id} delay={delay:.1f}s reason={reason!r} msg={msg_text[:50]!r}")
+                    else:
+                        logger.info(f"[humanizer] 缓回(LLM立即) session={session_id} reason={reason!r} msg={msg_text[:50]!r}")
+            else:
+                if self._probability_should_delay():
+                    delay = self._sample_delay()
+                    logger.info(f"[humanizer] 缓回(概率延迟) session={session_id} delay={delay:.1f}s msg={msg_text[:50]!r}")
+                else:
+                    delay = 0
+                    logger.info(f"[humanizer] 缓回(概率立即) session={session_id} msg={msg_text[:50]!r}")
+
             if delay > 0:
-                await asyncio.sleep(min(delay, 600))
-            self._skip_count[session_id] = 0
-        else:
-            # 概率模式
-            if not self._probability_should_reply():
-                self._skip_count[session_id] = skipped + 1
-                event.stop_event()
-                return
-            self._skip_count[session_id] = 0
+                # 可中断的延迟：下一条消息到达会 set 事件，提前结束等待
+                interrupted = False
+                try:
+                    await asyncio.wait_for(delay_evt.wait(), timeout=min(delay, 600))
+                    interrupted = True  # 被新消息打断
+                except asyncio.TimeoutError:
+                    pass  # 正常等待完毕
+                if interrupted:
+                    # 被新消息打断：把当前消息（含已合并的文本）存入合并缓冲，
+                    # 让下一条（正在等锁的）消息携带本消息一起回复。
+                    # 当前消息先发，所以插到缓冲前面。
+                    merge_buf.insert(0, event.message_str)
+                    logger.info(f"[humanizer] 被打断→消息合并到下一条 session={session_id} msg={event.message_str[:50]!r}")
+                    # 当前消息不回复（stop_event），由下一条消息合并后统一回复
+                    event.stop_event()
+                    return
+                # 正常等待完毕，放行回复
 
-    def _probability_should_reply(self) -> bool:
-        """概率模式：按时间段随机决定是否回复。返回 True=回复。"""
+    def _probability_should_delay(self) -> bool:
+        """概率模式：按时间段随机决定是否延迟回复。返回 True=延迟。"""
         now_hour = time.localtime().tm_hour
         day_start, day_end = self.read_no_reply_day_hours
+        # 白天延迟概率低，深夜延迟概率高
         prob = self.read_no_reply_prob_day if day_start <= now_hour < day_end else self.read_no_reply_prob_night
-        return random.random() >= prob
+        return random.random() < prob
 
-    async def _llm_decide_reply(self, event: AstrMessageEvent, msg_text: str, session_id: str, skipped: int) -> tuple[bool | None, float]:
-        """调用 LLM 判断是否回复、延迟多久。返回 (should_reply, delay_seconds)。失败返回 (None, 0)。"""
+    def _append_recent_message(self, session_id: str, sender_id: str, text: str, ts: float) -> None:
+        """把一条消息追加到会话的最近消息缓存（环形，最多保留 history_count 条）。"""
+        if not text:
+            return
+        buf = self._recent_messages.setdefault(session_id, [])
+        buf.append((sender_id, text, ts))
+        max_len = max(self.read_no_reply_llm_history_count, 1)
+        # 多保留一些，避免频繁截断；取最近 max_len*2 条
+        if len(buf) > max_len * 2:
+            del buf[:-max_len * 2]
+
+    def _format_recent_history(self, session_id: str, current_text: str) -> str:
+        """格式化最近聊天记录供 LLM 参考。返回多行字符串，可能为空。"""
+        count = self.read_no_reply_llm_history_count
+        if count <= 0:
+            return ""
+        buf = self._recent_messages.get(session_id)
+        if not buf:
+            return ""
+        # 取最近 count 条（当前消息已在 buf 末尾）
+        recent = buf[-count:]
+        lines = []
+        for sender, text, ts in recent:
+            # 用相对时间更直观：显示 HH:MM
+            try:
+                t = time.localtime(ts)
+                tstr = f"{t.tm_hour:02d}:{t.tm_min:02d}"
+            except Exception:
+                tstr = "--:--"
+            # 标记发送者
+            if sender == "__self__":
+                who = "我"
+            elif sender in self.admin_ids:
+                who = "管理员"
+            else:
+                who = "对方"
+            lines.append(f"[{tstr}] {who}: {text}")
+        return "\n".join(lines)
+
+    async def _llm_decide_reply(self, event: AstrMessageEvent, msg_text: str, session_id: str) -> tuple[float | None, str]:
+        """调用 LLM 判断延迟多久回复。返回 (delay_seconds, reason)。失败返回 (None, "")。"""
         try:
             provider = await self._get_provider(event)
             if provider is None:
-                return None, 0
+                return None, ""
             text_chat = getattr(provider, "text_chat", None)
             if not callable(text_chat):
-                return None, 0
+                return None, ""
 
             now = time.localtime()
             time_str = f"{now.tm_hour:02d}:{now.tm_min:02d}"
-            skip_info = f"\n对方已连续 {skipped} 条消息未得到回复" if skipped > 0 and self.read_no_reply_llm_include_skip else ""
+
+            # 最近聊天记录（含时间戳、发送者）
+            history_text = self._format_recent_history(session_id, msg_text)
+            history_block = ""
+            if history_text:
+                history_block = f"\n最近聊天记录：\n{history_text}\n"
 
             prompt = (
                 f"当前时间: {time_str}\n"
-                f"消息内容: {msg_text}\n"
-                f"{skip_info}\n"
+                f"{history_block}"
+                f"当前收到的消息: {msg_text}\n"
                 f"请输出 JSON。"
             )
 
@@ -444,10 +535,18 @@ class Humanizer(Star):
             )
             decision = self._parse_llm_decision(response)
             if decision is None:
-                return None, 0
-            return decision.get("reply", True), float(decision.get("delay_seconds", 0))
-        except (asyncio.TimeoutError, Exception):
-            return None, 0
+                logger.info(f"[humanizer] LLM决策解析失败 session={session_id} raw={str(response)[:200]!r}")
+                return None, ""
+            delay = float(decision.get("delay_seconds", 0))
+            reason = decision.get("reason", "")
+            logger.info(f"[humanizer] LLM决策 session={session_id} delay={delay}s reason={reason!r}")
+            return delay, reason
+        except asyncio.TimeoutError:
+            logger.info(f"[humanizer] LLM决策超时 session={session_id}")
+            return None, ""
+        except Exception as e:
+            logger.info(f"[humanizer] LLM决策异常 session={session_id} error={e}")
+            return None, ""
 
     async def _get_provider(self, event: AstrMessageEvent):
         """复用 astrbot 的 LLM provider。优先用配置的 provider_id，否则用当前会话默认。"""
@@ -516,7 +615,7 @@ class Humanizer(Star):
 
     @staticmethod
     def _parse_llm_decision(text: str) -> dict | None:
-        """从 LLM 输出中解析 JSON 决策。"""
+        """从 LLM 输出中解析 JSON 决策（含 delay_seconds 字段）。"""
         if not text:
             return None
         # 去掉可能的代码块包裹
@@ -525,16 +624,16 @@ class Humanizer(Star):
         # 尝试直接解析
         try:
             data = json.loads(text)
-            if isinstance(data, dict) and "reply" in data:
+            if isinstance(data, dict) and "delay_seconds" in data:
                 return data
         except Exception:
             pass
         # 尝试提取 JSON 片段
-        match = re.search(r"\{[^{}]*\"reply\"[^{}]*\}", text, re.DOTALL)
+        match = re.search(r"\{[^{}]*\"delay_seconds\"[^{}]*\}", text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group())
-                if isinstance(data, dict) and "reply" in data:
+                if isinstance(data, dict) and "delay_seconds" in data:
                     return data
             except Exception:
                 pass
@@ -565,6 +664,11 @@ class Humanizer(Star):
                     if self.delay_per_char > 0 and text:
                         delay += min(len(text) * self.delay_per_char, self.delay_max)
                     await asyncio.sleep(delay)
+                    # 把机器人发出的消息也存入历史缓存，让后续 LLM 决策能看到"我"说了什么
+                    if text:
+                        sid = event.get_group_id() or event.get_sender_id()
+                        if sid:
+                            self._append_recent_message(sid, "__self__", text, time.time())
                     return await original_send(message_chain, *args, **kwargs)
 
                 event.send = delayed_send

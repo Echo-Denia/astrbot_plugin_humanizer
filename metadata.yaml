@@ -16,9 +16,12 @@ desc: |
 
   仅在 aiocqhttp (NapCat/OneBot v11) 平台生效。
 version: "1.6.0"
-author: dingshaozhen
-repo: "https://github.com/dingshaozhen/astrbot_plugin_humanizer"
+author: Echo-Denia
+author_url: "https://github.com/Echo-Denia"
+social_link: "https://github.com/Echo-Denia"
+repo: "https://github.com/Echo-Denia/astrbot_plugin_humanizer"
 astrbot_version: ">=4.17.0"
+category: "工具"
 support_platforms:
   - aiocqhttp
 tags:
